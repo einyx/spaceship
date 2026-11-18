@@ -20,6 +20,8 @@ import { liveInfluence } from "./live-influence.ts"
 import { bindModeToggle } from "./live-mode.ts"
 import { liveRealization } from "./live-realization.ts"
 import { liveRelevance } from "./live-relevance.ts"
+import { prysmRelevance } from "./prysm-relevance.ts"
+import { host, prysmSource, steeringOf } from "../llm/prysm.ts"
 import { createPointer, type Aim, type PointerTarget, type SelectionPreview, type Zone } from "./pointer.ts"
 import { wordSpans, type Span } from "./segments.ts"
 import { simulatedAttention } from "./simulated-attention.ts"
@@ -51,13 +53,13 @@ const DRAG_SPEED_FULL = 1.2
 /** Tray controls sit flush with each other and the screen's bottom edge, so their brackets are drawn just inside them. */
 const TRAY_PAD_PX = -1
 
-const element = $("#text")
-const handle = $<HTMLButtonElement>("#pointer")
-const statusElement = $("#status")
-const soundToggle = $<HTMLButtonElement>("#sound-toggle")
-const modeToggle = $<HTMLButtonElement>("#mode-toggle")
-const extraLink = $<HTMLAnchorElement>("#extra-link")
-const railElement = $("#rail")
+const element = $("#sp-text")
+const handle = $<HTMLButtonElement>("#sp-pointer")
+const statusElement = $("#sp-status")
+const soundToggle = $<HTMLButtonElement>("#sp-sound-toggle")
+const modeToggle = $<HTMLButtonElement>("#sp-mode-toggle")
+const extraLink = $<HTMLAnchorElement>("#sp-extra-link")
+const railElement = $("#sp-rail")
 const style = getComputedStyle(element)
 await document.fonts.load(style.font)
 /** Measures where the first hidden word on the caret's line starts, in the text's font. */
@@ -65,16 +67,18 @@ const measure = document.createElement("canvas").getContext("2d")!
 measure.font = style.font
 
 const isLive = new URLSearchParams(location.search).get("live") === "true"
-const stream = createTextStream(isLive ? liveSource : simulatedSource, render)
+/** In Prysm the page hosts us: the text comes from the bridge's chat, not from a vendor's API. */
+const prysm = host()
+const stream = createTextStream(prysm ? prysmSource : isLive ? liveSource : simulatedSource, render)
 const rail = createLeftRail(railElement)
 const connections = createConnections({ source: isLive ? liveInfluence : simulatedInfluence, onChange: refreshRail })
-const relevance = createKeywordRelevance(isLive ? liveRelevance : simulatedRelevance, refreshRail)
+const relevance = createKeywordRelevance(prysm ? prysmRelevance : isLive ? liveRelevance : simulatedRelevance, refreshRail)
 const attention = createAttentionKnobs({
   source: isLive ? liveAttention : simulatedAttention,
   textElement: element,
   knob: handle,
-  linkPath: $<SVGPathElement>("#attention-links"),
-  activeLinkPath: $<SVGPathElement>("#attention-active-link"),
+  linkPath: $<SVGPathElement>("#sp-attention-links"),
+  activeLinkPath: $<SVGPathElement>("#sp-attention-active-link"),
   isPastEnd: (point) => isAhead(caretAt(point, metricsOf()), caret),
   onChange: invalidateFuture,
   onHover: (phrase) => {
@@ -84,11 +88,11 @@ const attention = createAttentionKnobs({
   onPaint: refreshRail,
 })
 const futureKnobs = createFutureKnobs({
-  template: $<HTMLTemplateElement>("#future-knob"),
+  template: $<HTMLTemplateElement>("#sp-future-knob"),
   mainKnob: handle,
-  linkPath: $<SVGPathElement>("#future-links"),
-  tunedLinkPath: $<SVGPathElement>("#future-tuned-link"),
-  hud: $<SVGGElement>("#future-hud"),
+  linkPath: $<SVGPathElement>("#sp-future-links"),
+  tunedLinkPath: $<SVGPathElement>("#sp-future-tuned-link"),
+  hud: $<SVGGElement>("#sp-future-hud"),
   source: isLive ? liveDimension : simulatedDimension,
   realization: isLive ? liveRealization : simulatedRealization,
   textElement: element,
@@ -96,6 +100,10 @@ const futureKnobs = createFutureKnobs({
   onChange: invalidateFuture,
 })
 let caret: Caret = { line: 0, x: 0 }
+/** In Prysm the text is a chat answer: the knob follows it as it arrives, until the person takes the wheel. */
+let followStream = prysm !== undefined
+let followFromWords = 0
+let followingCall = false
 let shownText = ""
 let story: StoryLayout = { content: "", text: "", combined: "", sentences: [] }
 let railFrame: number | undefined
@@ -119,7 +127,9 @@ let didHold = false
 /** The previous drag point, for how fast the knob moves. */
 let lastDrag: { point: Point; at: number } | undefined
 
-bindModeToggle(modeToggle, $<HTMLDialogElement>("#live-keys"), isLive)
+bindModeToggle(modeToggle, $<HTMLDialogElement>("#sp-live-keys"), isLive)
+// in Prysm there is no simulator to leave: the text always comes from the host
+if (prysm) modeToggle.hidden = true
 startSound()
 showSoundToggle()
 soundToggle.addEventListener("click", () => {
@@ -187,6 +197,94 @@ function moveTo({ x, y }: Point) {
   restartRest()
 }
 
+/** In Prysm each turn is read from its first word: while an answer streams, the window is held where the
+ * turn began so the words write themselves in below it, and the wheel returns to the hand afterwards.
+ * (The caret is the top of the visible window: chasing the text's end would slide past the last word
+ * and show nothing — upstream never moves its knob but by the hand.) */
+function followTheText() {
+  // `followingCall` breaks the synchronous loop render -> follow -> moveTo -> render
+  if (followingCall) return
+  const window = caretAfterWords(followFromWords)
+  if (!window) return
+  if (window.line === caret.line && Math.abs(window.x - caret.x) < 0.5) return
+  followingCall = true
+  try {
+    moveTo(pointAt(window, metricsOf()))
+  } finally {
+    followingCall = false
+  }
+}
+
+/** While an answer streams the knob reveals it on its own, at the pace a pull steers: it closes this share of its gap (in words) each second,
+ * between `MIN_REVEAL_WPS` and `MAX_REVEAL_WPS`. The knob never outruns the words that have arrived; it waits for the next. */
+const REVEAL_RATE = 2.5
+const MIN_REVEAL_WPS = 3
+const MAX_REVEAL_WPS = 40
+/** A reply that has not begun when the writing is first checked still gets this long to start before the knob is given back to the hand. */
+const REVEAL_GRACE_MS = 8000
+let revealFrame: number | undefined
+let revealLast = 0
+let revealCarry = 0
+let revealStartedAt = 0
+let revealedAny = false
+
+function revealTick(now: number) {
+  revealFrame = undefined
+  if (!followStream) return void (revealLast = 0)
+  const dt = revealLast ? Math.min(0.05, (now - revealLast) / 1000) : 0
+  revealLast = now
+  const gap = countWords(stream.text) - (shownCount ?? 0)
+  if (gap > 0) {
+    revealedAny = true
+    revealCarry += Math.min(MAX_REVEAL_WPS, Math.max(MIN_REVEAL_WPS, gap * REVEAL_RATE)) * dt
+    const words = Math.min(gap, Math.floor(revealCarry))
+    if (words > 0) {
+      revealCarry -= words
+      pullToward(0, 0, words)
+    }
+  } else {
+    revealCarry = 0
+    // caught up and the writing is done: the wheel goes back to the hand
+    if (!stream.activity().isGenerating && (revealedAny || now - revealStartedAt > REVEAL_GRACE_MS)) {
+      followStream = false
+      return void (revealLast = 0)
+    }
+  }
+  revealFrame = requestAnimationFrame(revealTick)
+}
+
+function startReveal() {
+  revealCarry = 0
+  revealLast = 0
+  revealedAny = false
+  revealStartedAt = performance.now()
+  revealFrame ??= requestAnimationFrame(revealTick)
+}
+/** Taking hold of the knob is a hand on the wheel: the person reads at their own pace from here on.
+ * A press elsewhere in the cockpit, a resize or our own following must not count as one. */
+;(element.closest(".space-shell") ?? element).addEventListener("pointerdown", ({ target }) => {
+  if (target instanceof Element && target.closest(".knob")) followStream = false
+})
+
+// The cockpit's panel settles after its view opens (and whenever the page around it reflows). The
+// app anchors on window resize, which never fires for a panel reflowing inside the page — so the
+// panel is watched, and each change is told to the app as the resize it already knows how to heed:
+// the drawing layer re-anchors and the knob finds the frontier again.
+if (prysm && "ResizeObserver" in globalThis) {
+  const shell = element.closest(".space-shell")
+  shell && new ResizeObserver(() => dispatchEvent(new Event("resize"))).observe(shell)
+}
+
+/** The host calls this when a message is sent: the window goes to where that answer begins. */
+;(globalThis as unknown as { __SPACESHIP__?: { resume(): void } }).__SPACESHIP__ = {
+  resume() {
+    followStream = true
+    followFromWords = countWords(stream.text)
+    followTheText() // the knob goes to where the answer will begin, then writes it in from there
+    startReveal()
+  },
+}
+
 /** The knob rests once it has not moved for `DWELL_MS`; the text past it is then generated again if a drag back discarded it. */
 function restartRest() {
   clearTimeout(restTimer)
@@ -220,7 +318,20 @@ async function revealAttention() {
   afterStreaming(futureKnobs.preload)
 }
 
+/** The drawing layer (#sp-space) holds everything the app positions in page coordinates; its origin is
+ *  kept at the page's corner so upstream's coordinates land true inside the cockpit's panel. Re-run on
+ *  every render: the panel's place in the page moves without any event when the page around it
+ *  reflows, and one stale reading misplaces the rail, the knob, the links and the fan at once. */
+function alignSpace() {
+  const space = document.getElementById("sp-space")
+  const rect = space?.parentElement?.getBoundingClientRect()
+  if (!space || !rect) return
+  space.style.left = `${-rect.left}px`
+  space.style.top = `${-rect.top}px`
+}
+
 function render() {
+  alignSpace()
   /** Unrounded, unlike `clientWidth`: a line that fills the column exactly measures a hair wider than the rounded width. */
   const lines = layoutLines(prepareWords(), caret, element.getBoundingClientRect().width)
   const text = lines.join(" ")
@@ -287,11 +398,20 @@ function afterStreaming(request: () => void) {
 function regenerateFuture() {
   isFutureStale = false
   restCount = shownCount ?? 0
-  stream.regenerate(shownCount ?? 0, "steering changed", steering())
+  const current = steering()
+  // Only a scrub back — text actually discarded — asks the model for another future. A pin settling or
+  // a knob tuning also lands here, and re-asking on those would have the cockpit answer on its own at
+  // every click; those wait for the next message instead, carrying the steering with it.
+  const before = countWords(stream.text)
+  stream.regenerate(shownCount ?? 0, "steering changed", current)
+  if (countWords(stream.text) < before) prysm?.regenerate(steeringOf(current))
 }
 
 function steering(): Steering {
-  return { leads: attention.leads(), controls: futureKnobs.controls() }
+  const current = { leads: attention.leads(), controls: futureKnobs.controls() }
+  // the host sends the steering with the next message, so it has to hear about every change
+  prysm?.setSteering(steeringOf(current))
+  return current
 }
 
 /**
@@ -368,9 +488,12 @@ function clientRectsOf({ start, end }: Span) {
 function zoneAt(target: Element, x: number, y: number): Zone {
   const point = { x: x + scrollX, y: y + scrollY }
   if (attention.isDragging()) return "box"
-  if (target.closest(".knob, button, a, #tray, dialog")) return "other"
+  // nothing outside the cockpit is ours to steer: the pill at the bottom, the tabs above, any part of
+  // the page around us. Without this the "ahead" test below is pure geometry and would swallow them.
+  if (!target.closest(".space-shell")) return "other"
+  if (target.closest(".knob, button, a, #sp-tray, dialog")) return "other"
   if (isAhead(caretAt(point, metricsOf()), caret)) return "ahead"
-  if (!target.closest("#text")) return "other"
+  if (!target.closest("#sp-text")) return "other"
   return attention.isOverBox(point) ? "box" : "text"
 }
 

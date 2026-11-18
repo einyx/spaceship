@@ -817,10 +817,10 @@
           translate: var(--x) var(--y);
         }
         /* the same dot over an attention box: it marks what a press would drag */
-        &:is([data-zone="ahead"], [data-zone="box"]) .dot {
+        &:not([data-zone="text"]) .dot {
           display: block;
         }
-        &:is([data-zone="ahead"], [data-zone="box"])[data-live] .dot {
+        &:not([data-zone="text"])[data-live] .dot {
           background: var(--hot);
         }
         .readout {

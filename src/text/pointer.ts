@@ -67,9 +67,12 @@ type Near = { target: PointerTarget; near: number; distance: number; point: Poin
  */
 export function createPointer({ layer, targets, isDragging, zoneAt, caretAt, selection, aim, pull }: PointerOptions) {
   /** It takes over from the OS pointer on the first mouse or pen movement, and steps aside as soon as a touch arrives, so hybrid devices work. */
+  /** The panel the layer is clipped to; none on the upstream page, where the layer covers the window. */
+  const home = layer.closest(".space-shell")
   const use = (isCustom: boolean) => {
-    if (isCustom) document.documentElement.dataset.cursor = "custom"
-    else delete document.documentElement.dataset.cursor
+    const shell = document.getElementById("view-chat") ?? document.documentElement
+    if (isCustom) shell.dataset.cursor = "custom"
+    else delete shell.dataset.cursor
   }
 
   layer.innerHTML = `
@@ -94,9 +97,29 @@ export function createPointer({ layer, targets, isDragging, zoneAt, caretAt, sel
   let last = 0
   let woken: HTMLElement[] = []
 
+  /** The layer's origin is kept on the viewport's corner so the page's coordinates (the hand, every target's box) land under the hand.
+   *  It measures the layer itself, not its parent, and runs on every move: the panel moves when the view is shown, the sidebar toggles or the shell scrolls. */
+  function alignLayer() {
+    // The layer must be as large as the window: inside the cockpit it sits in a zero-size anchor box, where `inset: 0` + `overflow: hidden`
+    // gave it no area at all, so nothing it drew was ever visible. It is then clipped to the panel, so the marks stop at the panel's edge.
+    layer.style.width = `${innerWidth}px`
+    layer.style.height = `${innerHeight}px`
+    const rect = layer.getBoundingClientRect()
+    if (rect.left !== 0 || rect.top !== 0) {
+      layer.style.left = `${(parseFloat(layer.style.left) || 0) - rect.left}px`
+      layer.style.top = `${(parseFloat(layer.style.top) || 0) - rect.top}px`
+    }
+    const panel = home?.getBoundingClientRect()
+    layer.style.clipPath = panel ? `inset(${panel.top}px ${innerWidth - panel.right}px ${innerHeight - panel.bottom}px ${panel.left}px)` : ""
+  }
+
+  alignLayer()
+  addEventListener("resize", alignLayer)
   addEventListener("pointermove", (event) => {
     if (event.pointerType === "touch") return
-    use(true)
+    // the OS pointer is hidden only where the page's own is drawn: over the cockpit. Past it (the pill, the tabs) the layer is clipped away, so hiding it there leaves no pointer at all.
+    use(!home || (event.target instanceof Node && home.contains(event.target)))
+    alignLayer()
     hand.x = event.clientX
     hand.y = event.clientY
     layer.style.setProperty("--x", `${hand.x}px`)
@@ -127,7 +150,14 @@ export function createPointer({ layer, targets, isDragging, zoneAt, caretAt, sel
     isPressed = false
     schedule()
   })
-  addEventListener("scroll", schedule, { passive: true })
+  addEventListener(
+    "scroll",
+    () => {
+      alignLayer()
+      schedule()
+    },
+    { passive: true },
+  )
 
   function schedule() {
     frame ??= requestAnimationFrame(tick)
